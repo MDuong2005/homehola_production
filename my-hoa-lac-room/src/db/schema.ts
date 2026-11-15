@@ -17,7 +17,7 @@ import {
 } from 'drizzle-orm/pg-core';
 
 /**
- * Custom INET type for PostgreSQL (supports IPv4/IPv6 addresses)
+ * Custom PostgreSQL 'inet' type for IP storage (IPv4 & IPv6)
  */
 const inet = customType<{ data: string }>({
   dataType() {
@@ -25,9 +25,9 @@ const inet = customType<{ data: string }>({
   },
 });
 
-// ==========================================================
-// ENUMS (matching SQL CHECK constraints)
-// ==========================================================
+// =============================================================================
+// ENUMS (Đồng bộ với CHECK constraints trong Database)
+// =============================================================================
 export const userRoleEnum = pgEnum('user_role', ['admin', 'ctv']);
 export const roomStatusEnum = pgEnum('room_status', ['available', 'rented']);
 export const spamBlocklistKindEnum = pgEnum('spam_blocklist_kind', ['phone', 'ip']);
@@ -40,9 +40,9 @@ export const appointmentStatusEnum = pgEnum('appointment_status', [
 ]);
 export const commissionStatusEnum = pgEnum('commission_status', ['pending', 'paid']);
 
-// ==========================================================
-// 1. USERS (Admin + CTV)
-// ==========================================================
+// =============================================================================
+// 1. USERS (Admin + CTV) - Có khóa tài khoản & lý do
+// =============================================================================
 export const users = pgTable(
   'users',
   {
@@ -52,22 +52,23 @@ export const users = pgTable(
     avatarUrl: text('avatar_url'),
     phone: varchar('phone', { length: 20 }),
     role: varchar('role', { length: 20 }).notNull().$type<'admin' | 'ctv'>(),
-    isActive: boolean('is_active').notNull().default(true),
+    isActive: boolean('is_active').notNull().default(true), // false = khóa, không đăng nhập được
     bannedReason: text('banned_reason'),
     bannedAt: timestamp('banned_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
   (table) => [
+    // Partial Index: Tối ưu tra cứu nhanh danh sách CTV đang hoạt động
     index('idx_users_active_ctv')
       .on(table.id)
       .where(sql`${table.role} = 'ctv' AND ${table.isActive} = true`),
   ]
 );
 
-// ==========================================================
-// 2. ROOMS
-// ==========================================================
+// =============================================================================
+// 2. ROOMS (Phòng trọ) - Hỗ trợ slug SEO, tiện ích JSONB, soft delete
+// =============================================================================
 export const rooms = pgTable(
   'rooms',
   {
@@ -76,28 +77,30 @@ export const rooms = pgTable(
     title: varchar('title', { length: 255 }).notNull(),
     description: text('description'),
     location: varchar('location', { length: 100 }).notNull(),
-    price: integer('price').notNull(), // Lưu VNĐ (lớn hơn 0)
-    area: numeric('area', { precision: 5, scale: 2 }).notNull(), // m2
-    utilities: jsonb('utilities').$type<string[]>().default([]),
+    price: integer('price').notNull(), // VNĐ (> 0)
+    area: numeric('area', { precision: 5, scale: 2 }).notNull(), // m2 (> 0)
+    utilities: jsonb('utilities').$type<string[]>().default([]), // Danh sách tiện ích
     status: varchar('status', { length: 20 })
       .notNull()
       .default('available')
       .$type<'available' | 'rented'>(),
-    deletedAt: timestamp('deleted_at', { withTimezone: true }),
+    deletedAt: timestamp('deleted_at', { withTimezone: true }), // Soft delete
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
   (table) => [
+    // Composite Partial Index: Bộ lọc phòng trống theo khu vực & khoảng giá
     index('idx_rooms_available')
       .on(table.location, table.price)
       .where(sql`${table.status} = 'available' AND ${table.deletedAt} IS NULL`),
+    // GIN Index cho cột utilities (JSONB) để tìm kiếm phòng theo tiện ích cực nhanh
     index('idx_rooms_utilities').using('gin', table.utilities),
   ]
 );
 
-// ==========================================================
-// 3. ROOM_IMAGES (Cloudflare R2)
-// ==========================================================
+// =============================================================================
+// 3. ROOM_IMAGES (Ảnh phòng lưu trên Cloudflare R2)
+// =============================================================================
 export const roomImages = pgTable(
   'room_images',
   {
@@ -105,30 +108,32 @@ export const roomImages = pgTable(
     roomId: integer('room_id')
       .notNull()
       .references(() => rooms.id, { onDelete: 'cascade' }),
-    url: text('url').notNull(),
-    r2Key: text('r2_key').notNull(),
+    url: text('url').notNull(), // Public URL CDN Cloudflare R2
+    r2Key: text('r2_key').notNull(), // S3 object key dùng để xóa file trên R2
     altText: varchar('alt_text', { length: 255 }),
     sortOrder: smallint('sort_order').notNull().default(0),
     isCover: boolean('is_cover').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   },
   (table) => [
+    // Index sắp xếp ảnh theo thứ tự sortOrder trong từng phòng
     index('idx_room_images_room').on(table.roomId, table.sortOrder),
+    // Partial Unique Index: Mỗi phòng chỉ có duy nhất 1 ảnh bìa đại diện
     uniqueIndex('uq_room_images_cover')
       .on(table.roomId)
       .where(sql`${table.isCover} = true`),
   ]
 );
 
-// ==========================================================
-// 4. SPAM_BLOCKLIST (Chặn SĐT / IP thủ công)
-// ==========================================================
+// =============================================================================
+// 4. SPAM_BLOCKLIST (Chặn thủ công SĐT / IP)
+// =============================================================================
 export const spamBlocklist = pgTable(
   'spam_blocklist',
   {
     id: serial('id').primaryKey(),
     kind: varchar('kind', { length: 10 }).notNull().$type<'phone' | 'ip'>(),
-    value: text('value').notNull(),
+    value: text('value').notNull(), // SĐT chuẩn hóa (dạng 0xxxxxxxxx) hoặc IP
     reason: text('reason'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   },
@@ -137,9 +142,9 @@ export const spamBlocklist = pgTable(
   ]
 );
 
-// ==========================================================
-// 5. APPOINTMENTS (Lịch hẹn + Chống spam)
-// ==========================================================
+// =============================================================================
+// 5. APPOINTMENTS (Lịch hẹn xem phòng + Dữ liệu chống spam)
+// =============================================================================
 export const appointments = pgTable(
   'appointments',
   {
@@ -149,7 +154,7 @@ export const appointments = pgTable(
       .references(() => rooms.id, { onDelete: 'restrict' }),
     refCtvId: integer('ref_ctv_id').references(() => users.id, {
       onDelete: 'set null',
-    }),
+    }), // CTV giới thiệu qua param ?ref=
     guestName: varchar('guest_name', { length: 100 }).notNull(),
     guestPhone: varchar('guest_phone', { length: 20 }).notNull(),
     appointmentTime: timestamp('appointment_time', {
@@ -161,7 +166,7 @@ export const appointments = pgTable(
       .default('pending')
       .$type<'pending' | 'contacted' | 'viewed' | 'completed' | 'cancelled'>(),
 
-    // Trạng thái gửi email thông báo
+    // Trạng thái gửi mail thông báo cho Admin
     emailSent: boolean('email_sent').notNull().default(false),
     emailAttempts: smallint('email_attempts').notNull().default(0),
     emailError: text('email_error'),
@@ -184,9 +189,9 @@ export const appointments = pgTable(
   ]
 );
 
-// ==========================================================
-// 6. COMMISSIONS (Hoa hồng CTV)
-// ==========================================================
+// =============================================================================
+// 6. COMMISSIONS (Hoa hồng Cộng tác viên)
+// =============================================================================
 export const commissions = pgTable(
   'commissions',
   {
@@ -196,12 +201,12 @@ export const commissions = pgTable(
     }),
     ctvId: integer('ctv_id')
       .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
+      .references(() => users.id, { onDelete: 'restrict' }), // Giữ lại lịch sử dòng tiền
     appointmentId: integer('appointment_id')
       .unique()
-      .references(() => appointments.id, { onDelete: 'set null' }),
+      .references(() => appointments.id, { onDelete: 'set null' }), // Chống tạo trùng hoa hồng
     guestName: varchar('guest_name', { length: 100 }).notNull(),
-    commissionAmount: integer('commission_amount').notNull(),
+    commissionAmount: integer('commission_amount').notNull(), // VNĐ (>= 0)
     status: varchar('status', { length: 20 })
       .notNull()
       .default('pending')
@@ -215,9 +220,9 @@ export const commissions = pgTable(
   ]
 );
 
-// ==========================================================
+// =============================================================================
 // RELATIONS (Drizzle ORM Relational Queries)
-// ==========================================================
+// =============================================================================
 export const usersRelations = relations(users, ({ many }) => ({
   appointments: many(appointments),
   commissions: many(commissions),
@@ -266,9 +271,9 @@ export const commissionsRelations = relations(commissions, ({ one }) => ({
   }),
 }));
 
-// ==========================================================
+// =============================================================================
 // TYPE INFERENCES (Tối ưu TypeScript DX)
-// ==========================================================
+// =============================================================================
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 
@@ -286,4 +291,3 @@ export type NewAppointment = typeof appointments.$inferInsert;
 
 export type Commission = typeof commissions.$inferSelect;
 export type NewCommission = typeof commissions.$inferInsert;
-
